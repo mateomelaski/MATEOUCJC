@@ -3,177 +3,106 @@ import pandas as pd
 import plotly.express as px
 import time
 import io
-import json
-
-from google import genai
-from google.genai import types
 
 # ---------------------------------------------------------
 # Configuración global
 # ---------------------------------------------------------
 st.set_page_config(page_title="HR Analytics · Clima laboral", page_icon="🏢", layout="wide")
 
-MODEL = "gemini-2.5-flash"
 COLOR_MAP = {'Positivo': '#2ecc71', 'Neutral': '#95a5a6', 'Negativo': '#e74c3c'}
 
 # ---------------------------------------------------------
-# Funciones de backend e IA
+# Funciones de backend (Simulación local sin coste)
 # ---------------------------------------------------------
-def get_client(api_key):
-    """Inicializa el cliente de Gemini API."""
-    return genai.Client(api_key=api_key)
+def keyword_classifier(comment, valid_topics):
+    """Clasifica sentimientos y temas localmente mediante heurística."""
+    comment_lower = str(comment).lower()
+    
+    # 1. Determinar Sentimiento
+    positivas = ["excelente", "buen", "me encanta", "feliz", "bien", "genial", "apoyo", "disponible", "guiar", "guía"]
+    negativas = ["mal", "terrible", "poco", "estrés", "falta", "injusto", "excesiv", "debajo", "necesitan mejorar", "no son"]
+    
+    score = sum(1 for w in positivas if w in comment_lower) - sum(1 for w in negativas if w in comment_lower)
+    sentimiento = "Positivo" if score > 0 else "Negativo" if score < 0 else "Neutral"
 
-def _call_api_with_retries(client, batch_df, temas, max_retries=3):
-    """
-    Envía un lote de comentarios a la API de Gemini pidiendo JSON estructurado.
-    Implementa reintentos con espera exponencial en caso de fallos.
-    """
-    batch_data = batch_df.to_dict('records')
-    prompt_data = json.dumps(batch_data, ensure_ascii=False)
+    # 2. Determinar Tema
+    diccionario_temas = {
+        "liderazgo": ["jefe", "líder", "manager", "direct", "guía", "jefatura"],
+        "compensación": ["sueldo", "salario", "pago", "beneficio", "dinero", "bono"],
+        "cultura": ["ambiente", "equipo", "amigables", "cultura", "compañer", "apoyo"],
+        "carga de trabajo": ["horas", "estrés", "carga", "excesiva", "equilibrio"],
+        "instalaciones": ["oficina", "silla", "baño", "instalaciones", "espacio", "sillas"],
+        "comunicación": ["comunicación", "objetivos", "información", "largo plazo"],
+        "desarrollo": ["curso", "desarrollo", "profesional", "crecimiento", "oportunidades"],
+        "evaluación": ["evaluación", "desempeño", "feedback"]
+    }
     
-    temas_str = ", ".join(temas)
-    
-    # Instrucciones detalladas para forzar el comportamiento analítico
-    system_instruction = f"""
-    Eres un analista experto en Recursos Humanos. Tu tarea es analizar la siguiente lista de comentarios extraídos de una encuesta de clima laboral.
-    Debes comprender el significado completo del comentario, detectando ironías, negaciones y contexto, sin dejarte llevar por palabras sueltas.
-    Si un comentario es mixto (ej. "el salario es bajo pero el equipo es genial"), evalúa cuál es el sentimiento dominante o, si están equilibrados, clasifícalo como Neutral.
-    
-    Reglas estrictas para el JSON de salida:
-    1. 'sentimiento' debe ser EXACTAMENTE uno de estos tres: Positivo, Negativo, Neutral.
-    2. 'tema' debe ser EXACTAMENTE uno de los temas permitidos, o 'Otro' si ninguno encaja.
-    Temas permitidos: {temas_str}.
-    """
-    
-    # Definición de esquema para Structured Output en google-genai
-    response_schema = types.Schema(
-        type=types.Type.ARRAY,
-        items=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "id": types.Schema(type=types.Type.INTEGER),
-                "sentimiento": types.Schema(
-                    type=types.Type.STRING, 
-                    enum=["Positivo", "Negativo", "Neutral"]
-                ),
-                "tema": types.Schema(type=types.Type.STRING)
-            },
-            required=["id", "sentimiento", "tema"]
-        )
-    )
-    
-    config = types.GenerateContentConfig(
-        temperature=0.0,
-        response_mime_type="application/json",
-        response_schema=response_schema,
-        system_instruction=system_instruction
-    )
-    
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=prompt_data,
-                config=config
-            )
-            
-            data = json.loads(response.text)
-            
-            # Validación de integridad de los IDs devueltos
-            expected_ids = set(batch_df['id'])
-            received_ids = set([item.get('id') for item in data if 'id' in item])
-            
-            if expected_ids.issubset(received_ids):
-                return data
-            else:
-                raise ValueError("Faltan IDs en la respuesta del modelo.")
+    for t_original in valid_topics:
+        t_lower = t_original.lower()
+        if t_lower in diccionario_temas:
+            if any(p in comment_lower for p in diccionario_temas[t_lower]):
+                return sentimiento, t_original
                 
-        except Exception as e:
-            if attempt < max_retries:
-                time.sleep((2 ** attempt) + 2)  # Backoff exponencial para sortear límite de cuota
-            else:
-                st.error(f"Error procesando lote tras {max_retries} intentos: {str(e)}")
-                # Retorno de seguridad para no romper todo el proceso
-                return [{"id": row['id'], "sentimiento": "Neutral", "tema": "Otro"} for _, row in batch_df.iterrows()]
+    # Fallback por coincidencia exacta
+    for t_original in valid_topics:
+        if t_original.lower() in comment_lower:
+            return sentimiento, t_original
+                
+    return sentimiento, "Otro / No clasificado"
 
-def classify_comments(df_comments, temas, client):
-    """
-    Divide los comentarios en lotes de 20 para su análisis iterativo.
-    """
+def classify_comments_mock(df_comments, temas):
+    """Procesa el dataframe y actualiza la barra de progreso."""
     results = []
-    batch_size = 20
-    total_batches = (len(df_comments) + batch_size - 1) // batch_size
-    
+    total = len(df_comments)
     progress_bar = st.progress(0, text="Iniciando análisis...")
     
-    for i in range(total_batches):
-        start_idx = i * batch_size
-        end_idx = min(start_idx + batch_size, len(df_comments))
-        batch = df_comments.iloc[start_idx:end_idx]
-        
-        progress_text = f"Procesando lote {i+1} de {total_batches} ({start_idx+1} al {end_idx})..."
-        progress_bar.progress(i / total_batches, text=progress_text)
-        
-        batch_results = _call_api_with_retries(client, batch, temas)
-        results.extend(batch_results)
-        
-        # Respetar rate limits de la capa gratuita entre lotes
-        if i < total_batches - 1:
-            time.sleep(4)
+    for i, row in df_comments.iterrows():
+        # Actualización de progreso fluida
+        if i % max(1, total // 10) == 0:
+            progress_bar.progress(i / total, text=f"Procesando comentario {i+1} de {total}...")
+            time.sleep(0.05) # Pequeño retardo visual
             
+        s, t = keyword_classifier(row['text'], temas)
+        results.append({"id": row['id'], "sentimiento": s, "tema": t})
+        
     progress_bar.progress(1.0, text="Análisis completado.")
-    time.sleep(1)
+    time.sleep(0.5)
     progress_bar.empty()
-    
     return results
 
-def generate_summary(client, df_results, comentario_col):
-    """
-    Genera un resumen ejecutivo extrayendo conclusiones globales.
-    """
+def generate_summary_mock(df_results):
+    """Redacta un resumen ejecutivo dinámicamente basado en los datos."""
     total = len(df_results)
     if total == 0:
         return "No hay datos para resumir."
         
     pos = len(df_results[df_results['Sentimiento'] == 'Positivo'])
     neg = len(df_results[df_results['Sentimiento'] == 'Negativo'])
-    neu = len(df_results[df_results['Sentimiento'] == 'Neutral'])
     
-    temas_count = df_results['Tema'].value_counts().to_dict()
+    pct_pos = (pos/total)*100
+    pct_neg = (neg/total)*100
     
-    # Extraer muestra representativa balanceada (máx 30)
-    sample_size = min(30, total)
-    sample_df = df_results.sample(n=sample_size, random_state=42)
-    sample_comments = sample_df[comentario_col].tolist()
+    tema_principal_negativo = None
+    if neg > 0:
+        tema_principal_negativo = df_results[df_results['Sentimiento'] == 'Negativo']['Tema'].mode()[0]
+    tema_principal_positivo = None
+    if pos > 0:
+        tema_principal_positivo = df_results[df_results['Sentimiento'] == 'Positivo']['Tema'].mode()[0]
+
+    resumen = f"El análisis revela que de un total de {total} comentarios procesados, "
+    if pct_pos > pct_neg:
+        resumen += f"el clima general es predominantemente positivo ({pct_pos:.1f}%). "
+    else:
+        resumen += f"existe una proporción significativa de insatisfacción ({pct_neg:.1f}% de comentarios negativos). "
+        
+    if tema_principal_positivo:
+        resumen += f"Como puntos fuertes, los empleados valoran especialmente los aspectos relacionados con **{tema_principal_positivo}**. "
+    if tema_principal_negativo:
+        resumen += f"Sin embargo, el principal foco de mejora detectado es **{tema_principal_negativo}**, área que concentra la mayor parte del feedback crítico. "
+        
+    resumen += "\n\n**Acciones recomendadas:**\n1. Realizar sesiones de escucha activa sobre las áreas más criticadas.\n2. Reforzar y comunicar las políticas de bienestar.\n3. Monitorear la evolución del sentimiento en el próximo trimestre."
     
-    prompt = f"""
-    Eres el Director de Recursos Humanos. Basándote en los resultados de la última encuesta de clima, redacta un resumen ejecutivo en español de máximo 120 palabras.
-    
-    Estadísticas globales ({total} comentarios):
-    - Positivos: {pos}
-    - Negativos: {neg}
-    - Neutrales: {neu}
-    - Frecuencia por temas: {json.dumps(temas_count, ensure_ascii=False)}
-    
-    Muestra de comentarios (para aportar contexto cualitativo):
-    {json.dumps(sample_comments, ensure_ascii=False)}
-    
-    El resumen debe incluir de forma concisa:
-    1. El clima general.
-    2. Los puntos fuertes principales.
-    3. Los principales focos de mejora.
-    4. 2-3 acciones recomendadas.
-    """
-    
-    try:
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.3)
-        )
-        return response.text
-    except Exception as e:
-        return f"No se pudo generar el resumen ejecutivo: {str(e)}"
+    return resumen
 
 
 # ---------------------------------------------------------
@@ -186,13 +115,6 @@ st.markdown("Análisis automatizado de comentarios abiertos mediante Inteligenci
 with st.sidebar:
     st.header("Configuración")
     
-    # Lectura de API Key
-    api_key = None
-    if "GEMINI_API_KEY" in st.secrets:
-        api_key = st.secrets["GEMINI_API_KEY"]
-    else:
-        api_key = st.text_input("Gemini API Key", type="password")
-        
     temas_defecto = "Liderazgo, Compensación, Cultura, Carga de trabajo, Instalaciones, Comunicación, Desarrollo, Evaluación"
     temas_input = st.text_area("Temas de interés (separados por coma)", value=temas_defecto)
     temas_validos = [t.strip() for t in temas_input.split(',') if t.strip()]
@@ -227,15 +149,11 @@ else:
         
     # Lógica de botón y estado
     if analizar_btn:
-        if not api_key:
-            st.error("Es necesaria la API Key de Gemini para analizar.")
-            st.stop()
-            
         df_target = df.copy()
         
         # Limitar a 300 filas
         if len(df_target) > 300:
-            st.warning("El archivo tiene más de 300 filas. Por seguridad y límites de cuota, solo se procesarán las primeras 300.")
+            st.warning("El archivo tiene más de 300 filas. Se procesarán solo las primeras 300.")
             df_target = df_target.head(300)
             
         # Preparación de datos (asignación de ID temporal para correlación)
@@ -247,20 +165,17 @@ else:
             'text': df_target[comentario_col].astype(str)
         })
         
-        # Ejecución
-        client = get_client(api_key)
-        
         with st.spinner("Clasificando comentarios..."):
-            resultados_json = classify_comments(df_to_process, temas_validos, client)
+            resultados_json = classify_comments_mock(df_to_process, temas_validos)
             
         # Correlación de resultados
         res_dict = {item['id']: item for item in resultados_json}
         df_target['Sentimiento'] = df_target['id_interno'].map(lambda x: res_dict.get(x, {}).get('sentimiento', 'Neutral'))
-        df_target['Tema'] = df_target['id_interno'].map(lambda x: res_dict.get(x, {}).get('tema', 'Otro'))
+        df_target['Tema'] = df_target['id_interno'].map(lambda x: res_dict.get(x, {}).get('tema', 'Otro / No clasificado'))
         df_target = df_target.drop(columns=['id_interno'])
         
         with st.spinner("Redactando resumen ejecutivo..."):
-            resumen = generate_summary(client, df_target, comentario_col)
+            resumen = generate_summary_mock(df_target)
             
         # Guardar en estado para persistir la vista
         st.session_state['df_analizado'] = df_target
