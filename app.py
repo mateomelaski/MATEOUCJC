@@ -3,204 +3,344 @@ import pandas as pd
 import plotly.express as px
 import time
 import io
+import json
 
-# Configuración de la página
-st.set_page_config(page_title="Analizador de Clima Laboral (Demo)", page_icon="🏢", layout="wide")
+from google import genai
+from google.genai import types
 
-st.title("HR Analytics: Analizador de Clima Laboral 🏢 (Versión Demo)")
-st.markdown("""
-Esta es una **versión de demostración** que utiliza un clasificador basado en palabras clave para emular el comportamiento de una IA. 
-La herramienta real (como se describe en el diseño) se conectaría a la API de Gemini para procesar el lenguaje natural.
+# ---------------------------------------------------------
+# Configuración global
+# ---------------------------------------------------------
+st.set_page_config(page_title="HR Analytics · Clima laboral", page_icon="🏢", layout="wide")
 
-**⚠️ Aviso de Privacidad y RGPD:** Asegúrate de que el archivo contiene comentarios anónimos sin datos personales identificables. Esta aplicación no almacena ningún dato en disco; todo se procesa en la memoria de la sesión temporal.
-""")
+MODEL = "gemini-2.5-flash"
+COLOR_MAP = {'Positivo': '#2ecc71', 'Neutral': '#95a5a6', 'Negativo': '#e74c3c'}
 
-# Barra lateral para configuración
-with st.sidebar:
-    st.header("Configuración ⚙️")
+# ---------------------------------------------------------
+# Funciones de backend e IA
+# ---------------------------------------------------------
+def get_client(api_key):
+    """Inicializa el cliente de Gemini API."""
+    return genai.Client(api_key=api_key)
+
+def _call_api_with_retries(client, batch_df, temas, max_retries=3):
+    """
+    Envía un lote de comentarios a la API de Gemini pidiendo JSON estructurado.
+    Implementa reintentos con espera exponencial en caso de fallos.
+    """
+    batch_data = batch_df.to_dict('records')
+    prompt_data = json.dumps(batch_data, ensure_ascii=False)
     
-    # Lista cerrada de temas (Configurable en la demo)
-    temas_defecto = "Liderazgo, Compensación, Cultura, Carga de trabajo, Instalaciones, Comunicación, Desarrollo, Evaluación"
-    temas_input = st.text_input("Temas de interés (separados por coma):", value=temas_defecto)
-    st.caption("Nota de la demo: El clasificador heurístico tiene palabras clave mapeadas para los temas por defecto. Si cambias los nombres (ej. 'Salario' en vez de 'Compensación'), puede que no los reconozca bien.")
-    temas_validos = [t.strip().lower() for t in temas_input.split(',')]
+    temas_str = ", ".join(temas)
     
-    uploaded_file = st.file_uploader("Sube los resultados de la encuesta (CSV o Excel)", type=["csv", "xlsx", "xls"])
-
-# Función de clasificación heurística (Demo sin IA)
-def keyword_classifier(comment, valid_topics):
-    comment_lower = str(comment).lower()
+    # Instrucciones detalladas para forzar el comportamiento analítico
+    system_instruction = f"""
+    Eres un analista experto en Recursos Humanos. Tu tarea es analizar la siguiente lista de comentarios extraídos de una encuesta de clima laboral.
+    Debes comprender el significado completo del comentario, detectando ironías, negaciones y contexto, sin dejarte llevar por palabras sueltas.
+    Si un comentario es mixto (ej. "el salario es bajo pero el equipo es genial"), evalúa cuál es el sentimiento dominante o, si están equilibrados, clasifícalo como Neutral.
     
-    # 1. Determinar Sentimiento por palabras clave
-    positivas = ["excelente", "buen", "me encanta", "feliz", "bien", "genial", "apoyo", "disponible", "guiar", "guía"]
-    negativas = ["mal", "terrible", "poco", "estrés", "falta", "injusto", "excesiv", "debajo", "necesitan mejorar", "no son"]
+    Reglas estrictas para el JSON de salida:
+    1. 'sentimiento' debe ser EXACTAMENTE uno de estos tres: Positivo, Negativo, Neutral.
+    2. 'tema' debe ser EXACTAMENTE uno de los temas permitidos, o 'Otro' si ninguno encaja.
+    Temas permitidos: {temas_str}.
+    """
     
-    score = 0
-    for w in positivas:
-        if w in comment_lower: score += 1
-    for w in negativas:
-        if w in comment_lower: score -= 1
-        
-    if score > 0:
-        sentimiento = "Positivo"
-    elif score < 0:
-        sentimiento = "Negativo"
-    else:
-        sentimiento = "Neutral"
-
-    # 2. Determinar Tema por palabras clave
-    tema = "Otro / No clasificado"
-    diccionario_temas = {
-        "liderazgo": ["jefe", "líder", "manager", "direct", "guía", "jefatura"],
-        "compensación": ["sueldo", "salario", "pago", "beneficio", "dinero", "bono"],
-        "cultura": ["ambiente", "equipo", "amigables", "cultura", "compañer", "apoyo"],
-        "carga de trabajo": ["horas", "estrés", "carga", "excesiva", "equilibrio"],
-        "instalaciones": ["oficina", "silla", "baño", "instalaciones", "espacio", "sillas"],
-        "comunicación": ["comunicación", "objetivos", "información", "largo plazo"],
-        "desarrollo": ["curso", "desarrollo", "profesional", "crecimiento", "oportunidades"],
-        "evaluación": ["evaluación", "desempeño", "feedback"]
-    }
+    # Definición de esquema para Structured Output en google-genai
+    response_schema = types.Schema(
+        type=types.Type.ARRAY,
+        items=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "id": types.Schema(type=types.Type.INTEGER),
+                "sentimiento": types.Schema(
+                    type=types.Type.STRING, 
+                    enum=["Positivo", "Negativo", "Neutral"]
+                ),
+                "tema": types.Schema(type=types.Type.STRING)
+            },
+            required=["id", "sentimiento", "tema"]
+        )
+    )
     
-    for t_valido in valid_topics:
-        if t_valido in diccionario_temas:
-            if any(palabra in comment_lower for palabra in diccionario_temas[t_valido]):
-                tema = next((t.strip() for t in temas_input.split(',') if t.strip().lower() == t_valido), t_valido.title())
-                break
-                
-    if tema == "Otro / No clasificado":
-        for t_valido in valid_topics:
-            if t_valido in comment_lower:
-                tema = next((t.strip() for t in temas_input.split(',') if t.strip().lower() == t_valido), t_valido.title())
-                break
-                
-    return sentimiento, tema
-
-if uploaded_file is not None:
-    try:
-        # Cache reset
-        if (
-            'df_procesado' not in st.session_state 
-            or st.session_state.get('last_uploaded') != uploaded_file.name
-            or st.session_state.get('last_temas') != temas_input
-        ):
-            if uploaded_file.name.endswith('.csv'):
-                df = pd.read_csv(uploaded_file)
-            else:
-                df = pd.read_excel(uploaded_file)
+    config = types.GenerateContentConfig(
+        temperature=0.0,
+        response_mime_type="application/json",
+        response_schema=response_schema,
+        system_instruction=system_instruction
+    )
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=prompt_data,
+                config=config
+            )
             
-            comentario_col = None
-            for col in df.columns:
-                if any(x in col.lower() for x in ["comentario", "respuesta", "feedback"]):
-                    comentario_col = col
-                    break
-                    
-            if comentario_col is None:
-                st.error("No se encontró una columna llamada 'Comentario', 'Respuesta' o 'Feedback' en el archivo.")
-                st.stop()
+            data = json.loads(response.text)
+            
+            # Validación de integridad de los IDs devueltos
+            expected_ids = set(batch_df['id'])
+            received_ids = set([item.get('id') for item in data if 'id' in item])
+            
+            if expected_ids.issubset(received_ids):
+                return data
+            else:
+                raise ValueError("Faltan IDs en la respuesta del modelo.")
                 
-            with st.spinner('Analizando mediante palabras clave (Modo Demo)...'):
-                time.sleep(1) # Simular latencia
-                sentimientos = []
-                temas = []
-                for comment in df[comentario_col]:
-                    s, t = keyword_classifier(comment, temas_validos)
-                    sentimientos.append(s)
-                    temas.append(t)
-                
-                df['Sentimiento'] = sentimientos
-                df['Tema Principal'] = temas
-                
-                st.session_state['df_procesado'] = df
-                st.session_state['last_uploaded'] = uploaded_file.name
-                st.session_state['last_temas'] = temas_input
+        except Exception as e:
+            if attempt < max_retries:
+                time.sleep((2 ** attempt) + 2)  # Backoff exponencial para sortear límite de cuota
+            else:
+                st.error(f"Error procesando lote tras {max_retries} intentos: {str(e)}")
+                # Retorno de seguridad para no romper todo el proceso
+                return [{"id": row['id'], "sentimiento": "Neutral", "tema": "Otro"} for _, row in batch_df.iterrows()]
 
-        df = st.session_state['df_procesado']
+def classify_comments(df_comments, temas, client):
+    """
+    Divide los comentarios en lotes de 20 para su análisis iterativo.
+    """
+    results = []
+    batch_size = 20
+    total_batches = (len(df_comments) + batch_size - 1) // batch_size
+    
+    progress_bar = st.progress(0, text="Iniciando análisis...")
+    
+    for i in range(total_batches):
+        start_idx = i * batch_size
+        end_idx = min(start_idx + batch_size, len(df_comments))
+        batch = df_comments.iloc[start_idx:end_idx]
         
-        st.success("¡Análisis completado exitosamente!")
+        progress_text = f"Procesando lote {i+1} de {total_batches} ({start_idx+1} al {end_idx})..."
+        progress_bar.progress(i / total_batches, text=progress_text)
         
-        # --- DASHBOARD ---
-        st.header("📊 Dashboard de Resultados")
+        batch_results = _call_api_with_retries(client, batch, temas)
+        results.extend(batch_results)
+        
+        # Respetar rate limits de la capa gratuita entre lotes
+        if i < total_batches - 1:
+            time.sleep(4)
+            
+    progress_bar.progress(1.0, text="Análisis completado.")
+    time.sleep(1)
+    progress_bar.empty()
+    
+    return results
+
+def generate_summary(client, df_results, comentario_col):
+    """
+    Genera un resumen ejecutivo extrayendo conclusiones globales.
+    """
+    total = len(df_results)
+    if total == 0:
+        return "No hay datos para resumir."
+        
+    pos = len(df_results[df_results['Sentimiento'] == 'Positivo'])
+    neg = len(df_results[df_results['Sentimiento'] == 'Negativo'])
+    neu = len(df_results[df_results['Sentimiento'] == 'Neutral'])
+    
+    temas_count = df_results['Tema'].value_counts().to_dict()
+    
+    # Extraer muestra representativa balanceada (máx 30)
+    sample_size = min(30, total)
+    sample_df = df_results.sample(n=sample_size, random_state=42)
+    sample_comments = sample_df[comentario_col].tolist()
+    
+    prompt = f"""
+    Eres el Director de Recursos Humanos. Basándote en los resultados de la última encuesta de clima, redacta un resumen ejecutivo en español de máximo 120 palabras.
+    
+    Estadísticas globales ({total} comentarios):
+    - Positivos: {pos}
+    - Negativos: {neg}
+    - Neutrales: {neu}
+    - Frecuencia por temas: {json.dumps(temas_count, ensure_ascii=False)}
+    
+    Muestra de comentarios (para aportar contexto cualitativo):
+    {json.dumps(sample_comments, ensure_ascii=False)}
+    
+    El resumen debe incluir de forma concisa:
+    1. El clima general.
+    2. Los puntos fuertes principales.
+    3. Los principales focos de mejora.
+    4. 2-3 acciones recomendadas.
+    """
+    
+    try:
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.3)
+        )
+        return response.text
+    except Exception as e:
+        return f"No se pudo generar el resumen ejecutivo: {str(e)}"
+
+
+# ---------------------------------------------------------
+# Interfaz de Usuario (UI)
+# ---------------------------------------------------------
+st.title("HR Analytics · Clima laboral")
+st.markdown("Análisis automatizado de comentarios abiertos mediante Inteligencia Artificial.")
+
+# --- SIDEBAR ---
+with st.sidebar:
+    st.header("Configuración")
+    
+    # Lectura de API Key
+    api_key = None
+    if "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    else:
+        api_key = st.text_input("Gemini API Key", type="password")
+        
+    temas_defecto = "Liderazgo, Compensación, Cultura, Carga de trabajo, Instalaciones, Comunicación, Desarrollo, Evaluación"
+    temas_input = st.text_area("Temas de interés (separados por coma)", value=temas_defecto)
+    temas_validos = [t.strip() for t in temas_input.split(',') if t.strip()]
+    
+    uploaded_file = st.file_uploader("Archivo de encuestas (CSV/Excel)", type=["csv", "xlsx", "xls"])
+    analizar_btn = st.button("Analizar datos")
+
+# --- MAIN ÁREA ---
+if uploaded_file is None:
+    st.info("Sube un archivo de encuestas en la barra lateral para comenzar.")
+else:
+    # 1. Leer archivo
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        st.error(f"Error al leer el archivo: {e}")
+        st.stop()
+
+    # 2. Detección automática de la columna
+    comentario_col = None
+    cols_lower = [c.lower() for c in df.columns]
+    for orig, lower in zip(df.columns, cols_lower):
+        if any(keyword in lower for keyword in ["comentario", "respuesta", "feedback"]):
+            comentario_col = orig
+            break
+            
+    if not comentario_col:
+        comentario_col = st.selectbox("Selecciona la columna que contiene los comentarios:", df.columns)
+        
+    # Lógica de botón y estado
+    if analizar_btn:
+        if not api_key:
+            st.error("Es necesaria la API Key de Gemini para analizar.")
+            st.stop()
+            
+        df_target = df.copy()
+        
+        # Limitar a 300 filas
+        if len(df_target) > 300:
+            st.warning("El archivo tiene más de 300 filas. Por seguridad y límites de cuota, solo se procesarán las primeras 300.")
+            df_target = df_target.head(300)
+            
+        # Preparación de datos (asignación de ID temporal para correlación)
+        df_target = df_target.reset_index(drop=True)
+        df_target['id_interno'] = df_target.index
+        
+        df_to_process = pd.DataFrame({
+            'id': df_target['id_interno'],
+            'text': df_target[comentario_col].astype(str)
+        })
+        
+        # Ejecución
+        client = get_client(api_key)
+        
+        with st.spinner("Clasificando comentarios..."):
+            resultados_json = classify_comments(df_to_process, temas_validos, client)
+            
+        # Correlación de resultados
+        res_dict = {item['id']: item for item in resultados_json}
+        df_target['Sentimiento'] = df_target['id_interno'].map(lambda x: res_dict.get(x, {}).get('sentimiento', 'Neutral'))
+        df_target['Tema'] = df_target['id_interno'].map(lambda x: res_dict.get(x, {}).get('tema', 'Otro'))
+        df_target = df_target.drop(columns=['id_interno'])
+        
+        with st.spinner("Redactando resumen ejecutivo..."):
+            resumen = generate_summary(client, df_target, comentario_col)
+            
+        # Guardar en estado para persistir la vista
+        st.session_state['df_analizado'] = df_target
+        st.session_state['resumen_ejecutivo'] = resumen
+        st.session_state['last_file'] = uploaded_file.name
+        st.session_state['last_temas'] = temas_input
+        
+    # Comprobar si se ha modificado la configuración desde el último análisis
+    needs_recalc = False
+    if 'df_analizado' in st.session_state:
+        if st.session_state.get('last_file') != uploaded_file.name or st.session_state.get('last_temas') != temas_input:
+            needs_recalc = True
+            
+    if needs_recalc:
+        st.warning("La configuración o el archivo han cambiado. Pulsa 'Analizar datos' para actualizar.")
+
+    # --- DASHBOARD DE RESULTADOS ---
+    if 'df_analizado' in st.session_state and not needs_recalc:
+        df_result = st.session_state['df_analizado']
+        resumen = st.session_state['resumen_ejecutivo']
+        
+        st.success("Análisis completado con éxito.")
+        
+        # 1. KPIs
+        total = len(df_result)
+        pos = len(df_result[df_result['Sentimiento'] == 'Positivo'])
+        neg = len(df_result[df_result['Sentimiento'] == 'Negativo'])
         
         col1, col2, col3 = st.columns(3)
-        total_comentarios = len(df)
-        positivos = len(df[df['Sentimiento'] == 'Positivo'])
-        negativos = len(df[df['Sentimiento'] == 'Negativo'])
+        col1.metric("Total Comentarios", total)
+        col2.metric("Positivos", f"{(pos/total)*100:.1f}%" if total > 0 else "0%")
+        col3.metric("Negativos", f"{(neg/total)*100:.1f}%" if total > 0 else "0%")
         
-        pct_pos = (positivos/total_comentarios)*100 if total_comentarios > 0 else 0
-        pct_neg = (negativos/total_comentarios)*100 if total_comentarios > 0 else 0
+        # 2. Resumen Ejecutivo
+        st.subheader("Resumen Ejecutivo")
+        st.info(resumen)
         
-        col1.metric("Total de Comentarios", total_comentarios)
-        col2.metric("Comentarios Positivos", f"{positivos} ({pct_pos:.1f}%)")
-        col3.metric("Comentarios Negativos", f"{negativos} ({pct_neg:.1f}%)")
+        # 3. Gráficos
+        st.subheader("Análisis Visual")
+        col_c1, col_c2 = st.columns(2)
         
-        col_chart1, col_chart2 = st.columns(2)
-        with col_chart1:
-            st.subheader("Distribución de Sentimiento")
-            fig_sentiment = px.pie(df, names='Sentimiento', color='Sentimiento',
-                                 color_discrete_map={'Positivo':'#2ecc71', 'Neutral':'#95a5a6', 'Negativo':'#e74c3c'})
-            st.plotly_chart(fig_sentiment)
+        with col_c1:
+            fig_pie = px.pie(df_result, names='Sentimiento', color='Sentimiento', 
+                             color_discrete_map=COLOR_MAP, title="Distribución Global del Clima")
+            st.plotly_chart(fig_pie)
             
-        with col_chart2:
-            st.subheader("Temas Principales")
-            tema_counts = df['Tema Principal'].value_counts().reset_index()
-            tema_counts.columns = ['Tema Principal', 'Cantidad']
-            fig_temas = px.bar(tema_counts, x='Tema Principal', y='Cantidad', color='Tema Principal')
-            st.plotly_chart(fig_temas)
+        with col_c2:
+            tema_counts = df_result['Tema'].value_counts().reset_index()
+            fig_bar = px.bar(tema_counts, x='Tema', y='count', title="Frecuencia de Temas")
+            st.plotly_chart(fig_bar)
+            
+        tema_sent = df_result.groupby(['Tema', 'Sentimiento']).size().reset_index(name='Cantidad')
+        fig_stack = px.bar(tema_sent, x='Tema', y='Cantidad', color='Sentimiento', 
+                           color_discrete_map=COLOR_MAP, title="Impacto del Sentimiento por Tema", barmode='stack')
+        st.plotly_chart(fig_stack)
         
-        # Resumen Ejecutivo Dinámico
-        st.subheader("🤖 Resumen Ejecutivo (Construido Dinámicamente)")
-        tema_principal_negativo = None
-        if negativos > 0:
-            tema_principal_negativo = df[df['Sentimiento'] == 'Negativo']['Tema Principal'].mode()[0]
-        tema_principal_positivo = None
-        if positivos > 0:
-            tema_principal_positivo = df[df['Sentimiento'] == 'Positivo']['Tema Principal'].mode()[0]
-
-        resumen_texto = f"Se han analizado **{total_comentarios} comentarios**. "
-        if pct_pos > pct_neg:
-            resumen_texto += f"El clima general es mayormente **positivo ({pct_pos:.1f}%)**. "
-        else:
-            resumen_texto += f"Existe una proporción significativa de comentarios **negativos ({pct_neg:.1f}%)**. "
-            
-        if tema_principal_positivo:
-            resumen_texto += f"Los empleados valoran especialmente aspectos relacionados con **{tema_principal_positivo}**. "
-        if tema_principal_negativo:
-            resumen_texto += f"Sin embargo, el área más crítica que requiere atención es **{tema_principal_negativo}**, ya que concentra la mayor cantidad de feedback negativo."
-            
-        st.info(resumen_texto)
+        # 4. Datos y Exportación
+        st.subheader("Desglose Detallado")
         
-        # Tabla
-        st.subheader("📝 Datos Detallados")
-        col_filtro1, col_filtro2 = st.columns(2)
-        with col_filtro1:
-            filtro_sentimiento = st.selectbox("Filtrar por Sentimiento:", ["Todos"] + list(df['Sentimiento'].unique()))
-        with col_filtro2:
-            filtro_tema = st.selectbox("Filtrar por Tema:", ["Todos"] + list(df['Tema Principal'].unique()))
+        f_col1, f_col2 = st.columns(2)
+        with f_col1:
+            filtro_sent = st.selectbox("Sentimiento", ["Todos"] + list(df_result['Sentimiento'].unique()))
+        with f_col2:
+            filtro_tema = st.selectbox("Tema", ["Todos"] + list(df_result['Tema'].unique()))
             
-        df_filtrado = df.copy()
-        if filtro_sentimiento != "Todos":
-            df_filtrado = df_filtrado[df_filtrado['Sentimiento'] == filtro_sentimiento]
+        df_filtered = df_result.copy()
+        if filtro_sent != "Todos":
+            df_filtered = df_filtered[df_filtered['Sentimiento'] == filtro_sent]
         if filtro_tema != "Todos":
-            df_filtrado = df_filtrado[df_filtrado['Tema Principal'] == filtro_tema]
+            df_filtered = df_filtered[df_filtered['Tema'] == filtro_tema]
             
-        st.dataframe(df_filtrado)
-            
-        # Descargas
-        st.markdown("### Descargar Resultados")
-        col_dl1, col_dl2 = st.columns(2)
+        st.dataframe(df_filtered)
         
-        csv_export = df_filtrado.to_csv(index=False).encode('utf-8')
-        with col_dl1:
-            st.download_button("📥 Descargar CSV", csv_export, 'analisis_clima_hr.csv', 'text/csv')
-            
+        # Botones de descarga
+        dl_col1, dl_col2 = st.columns(2)
+        csv_data = df_filtered.to_csv(index=False).encode('utf-8')
+        dl_col1.download_button("Descargar CSV", csv_data, 'clima_laboral.csv', 'text/csv')
+        
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df_filtrado.to_excel(writer, index=False, sheet_name='Resultados')
-        with col_dl2:
-            st.download_button("📥 Descargar Excel", buffer.getvalue(), 'analisis_clima_hr.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-
-    except Exception as e:
-        st.error(f"Error al procesar el archivo: {e}")
-
-elif uploaded_file is None:
-    st.info("Por favor, sube un archivo CSV o Excel con las encuestas para comenzar.")
+            df_filtered.to_excel(writer, index=False, sheet_name='Resultados')
+        dl_col2.download_button("Descargar Excel", buffer.getvalue(), 'clima_laboral.xlsx', 
+                                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
