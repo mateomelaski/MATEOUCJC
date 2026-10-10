@@ -1,0 +1,22 @@
+# Secretos (NUNCA subir a GitHub)
+.streamlit/secrets.toml
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Entorno / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Datos reales de encuestas (pueden contener información personal)
+datos_reales/
+*.xlsx
+*.xls
