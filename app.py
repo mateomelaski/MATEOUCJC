@@ -28,7 +28,7 @@ import streamlit as st
 MAX_FILAS = 300          # máximo de comentarios que se analizan
 TAM_LOTE = 20            # comentarios por llamada a Gemini
 OTRO = "Otro / No clasificado"
-MODELO_DEFECTO = "gemini-2.5-flash"   # editable en la barra lateral
+MODELO_DEFECTO = "gemini-3.8-flash"   # editable en la barra lateral
 MODO_GEMINI = "Gemini (IA)"
 MODO_LOCAL = "Local (sin clave)"
 SENTIMIENTOS = ["Positivo", "Neutral", "Negativo"]
