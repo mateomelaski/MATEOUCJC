@@ -137,7 +137,22 @@ def keyword_classifier(comentario, temas_validos):
 def crear_cliente(api_key):
     """Crea el cliente de Gemini (la librería solo se importa si se usa este modo)."""
     from google import genai
+    api_key = api_key.strip()
+    if api_key.startswith("AQ."):
+        # Claves de Vertex AI (modo exprés): empiezan por "AQ."
+        return genai.Client(vertexai=True, api_key=api_key)
+    # Claves de Google AI Studio: empiezan por "AIza"
     return genai.Client(api_key=api_key)
+
+
+def describir_error(e, api_key=""):
+    """Texto breve y seguro (sin la clave) con el motivo del error de la API."""
+    codigo = getattr(e, "code", None) or getattr(e, "status_code", None)
+    mensaje = getattr(e, "message", None) or str(e)
+    texto = f"{type(e).__name__}" + (f" {codigo}" if codigo else "") + f": {mensaje}"
+    if api_key:
+        texto = texto.replace(api_key, "***")
+    return texto[:250]
 
 
 def llamar_gemini(cliente, prompt, modelo, json_mode=True, temperatura=0.0):
@@ -186,7 +201,7 @@ def parsear_respuesta(texto, ids_validos, temas):
     return resultado
 
 
-def classify_comments(textos, temas, cliente=None, modelo=MODELO_DEFECTO):
+def classify_comments(textos, temas, cliente=None, modelo=MODELO_DEFECTO, api_key=""):
     """
     Clasifica todos los comentarios mostrando una barra de progreso.
     Con cliente de Gemini: por lotes; los que fallen se clasifican en local.
@@ -208,7 +223,7 @@ def classify_comments(textos, temas, cliente=None, modelo=MODELO_DEFECTO):
                     parcial = parsear_respuesta(texto, ids, temas)
                     break
                 except Exception as e:  # noqa: BLE001
-                    ultimo_error = type(e).__name__
+                    ultimo_error = describir_error(e, api_key)
                     time.sleep(1)
         for i, comentario in lote:
             if i in parcial:
@@ -405,9 +420,9 @@ def main():
             try:
                 cliente = crear_cliente(clave)
             except Exception as e:  # noqa: BLE001
-                avisos.append(f"No se pudo iniciar Gemini ({type(e).__name__}). Se usa el modo local.")
+                avisos.append(f"No se pudo iniciar Gemini ({describir_error(e, clave)}). Se usa el modo local.")
 
-        resultados, n_respaldo, error = classify_comments(textos, temas, cliente, modelo)
+        resultados, n_respaldo, error = classify_comments(textos, temas, cliente, modelo, clave)
         base["Sentimiento"] = [r[0] for r in resultados]
         base["Tema"] = [r[1] for r in resultados]
         base["Comentario_analizado"] = textos
