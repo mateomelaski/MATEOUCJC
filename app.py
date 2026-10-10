@@ -137,12 +137,8 @@ def keyword_classifier(comentario, temas_validos):
 def crear_cliente(api_key):
     """Crea el cliente de Gemini (la librería solo se importa si se usa este modo)."""
     from google import genai
-    api_key = api_key.strip()
-    if api_key.startswith("AQ."):
-        # Claves de Vertex AI (modo exprés): empiezan por "AQ."
-        return genai.Client(vertexai=True, api_key=api_key)
-    # Claves de Google AI Studio: empiezan por "AIza"
-    return genai.Client(api_key=api_key)
+    # Claves de Google AI Studio / Gemini API (pueden empezar por "AIza" o por "AQ.")
+    return genai.Client(api_key=api_key.strip())
 
 
 def describir_error(e, api_key=""):
